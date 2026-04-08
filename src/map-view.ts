@@ -34,14 +34,14 @@ interface MapConfig {
 	currentTileSetId: string | null;
 }
 
-export const MapViewType = 'map';
+export const MapViewType = "history-map";
 
-export class MapView extends BasesView {
+export class HistoryMapView extends BasesView {
 	type = MapViewType;
 	scrollEl: HTMLElement;
 	containerEl: HTMLElement;
 	mapEl: HTMLElement;
-	plugin: ObsidianMapsPlugin;
+	plugin: ObsidianHistoryMapsPlugin;
 
 	// Internal rendering data
 	private map: Map | null = null;
