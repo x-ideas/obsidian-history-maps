@@ -22,7 +22,7 @@ export interface HistoryMapPoint {
 	 * When set, only points with this year (or no `year`) show for the active
 	 * timeline year — same rule as Bases map marker filtering.
 	 */
-	year?: number;
+	year?: number | string | Date | { year?: number; toDate?: () => Date };
 	properties?: Record<string, string | number | boolean | null | undefined>;
 	/**
 	 * If set (and no custom click handler on the layer), default click opens
@@ -67,10 +67,55 @@ function filterPointsByTimelineYear(
 ): HistoryMapPoint[] {
 	const y = Math.trunc(Number.parseInt(String(timelineYear), 10));
 	return points.filter((p) => {
+		// When unset, keep points visible (same as Bases behavior).
 		if (p.year == null) {
+			return true;
+		}
+
+		let py: number | null = null;
+		// Obsidian's DateTime is typically a Moment-like object with `.year()` or `.toDate()`.
+		// We avoid importing moment types here; just duck-type the methods/fields we need.
+		if (
+			typeof p.year === "object" &&
+			p.year != null &&
+			"year" in p.year &&
+			typeof (p.year as any).year === "number"
+		) {
+			py = Math.trunc((p.year as any).year);
+		} else if (
+			typeof p.year === "object" &&
+			p.year != null &&
+			"year" in p.year &&
+			typeof (p.year as any).year === "function"
+		) {
+			const n = (p.year as any).year();
+			py = typeof n === "number" && Number.isFinite(n) ? Math.trunc(n) : null;
+		} else if (
+			typeof p.year === "object" &&
+			p.year != null &&
+			"toDate" in p.year &&
+			typeof (p.year as any).toDate === "function"
+		) {
+			const d = (p.year as any).toDate();
+			if (d instanceof Date) py = d.getFullYear();
+		} else if (p.year instanceof Date) {
+			py = p.year.getFullYear();
+		} else if (typeof p.year === "number") {
+			py = Number.isFinite(p.year) ? Math.trunc(p.year) : null;
+		} else if (typeof p.year === "string") {
+			const s = p.year.trim();
+			// Accept "2020" or "2020-01-01" etc.
+			const m = s.match(/^(-?\d{1,4})/);
+			if (m) {
+				const n = Number.parseInt(m[1], 10);
+				py = Number.isFinite(n) ? Math.trunc(n) : null;
+			}
+		}
+
+		if (py == null) {
 			return false;
 		}
-		return Math.trunc(p.year) === y;
+		return py === y;
 	});
 }
 

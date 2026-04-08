@@ -629,8 +629,14 @@ export class HistoryMapView extends BasesView {
 
 	private loadConfig(currentTileSetId: string | null): MapConfig {
 		// Load property configurations
-		const coordinatesProp = this.config.getAsPropertyId("coordinates");
-		const yearProperty = this.config.getAsPropertyId("yearProperty");
+		// Bases view option defaults are not always materialized into config storage,
+		// so we apply the same defaults here when the user hasn't set a value.
+		const coordinatesProp =
+			this.config.getAsPropertyId("coordinates") ??
+			("note.coordinates" as BasesPropertyId);
+		const yearProperty =
+			this.config.getAsPropertyId("yearProperty") ??
+			("note.start" as BasesPropertyId);
 		const markerIconProp = this.config.getAsPropertyId("markerIcon");
 		const markerColorProp = this.config.getAsPropertyId("markerColor");
 
@@ -924,6 +930,7 @@ export class HistoryMapView extends BasesView {
 						displayName: "Year property",
 						type: "property",
 						key: "yearProperty",
+						default: "note.start",
 					},
 					{
 						displayName: "Center coordinates",
@@ -968,6 +975,7 @@ export class HistoryMapView extends BasesView {
 						displayName: "Marker coordinates",
 						type: "property",
 						key: "coordinates",
+						default: "note.coordinates",
 						filter: (prop) => !prop.startsWith("file."),
 						placeholder: "Property",
 					},

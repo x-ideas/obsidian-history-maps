@@ -13,7 +13,7 @@ export default class ObsidianHistoryMapsPlugin extends Plugin {
 
 	/** Exposed for other plugins or custom code (see {@link renderHistoryMap}). */
 	api = {
-		renderHistoryMap: (
+		render: (
 			container: HTMLElement,
 			options?: RenderHistoryMapOptions,
 		) => renderHistoryMap(this, container, options),
