@@ -1,3 +1,4 @@
+import "./app.css";
 import { Plugin } from "obsidian";
 import { HistoryMapView } from "./map-view";
 import { MapSettings, DEFAULT_SETTINGS, MapSettingTab } from "./settings";
