@@ -22,8 +22,12 @@ export interface MountHistoryMapConfigPaneOptions {
 	map: Map;
 	mapElement: HTMLElement;
 	binding: HistoryMapConfigBinding;
-	onYearChange: (year: number) => void;
-	onTimeMapSourceChange: (name: string) => void;
+	onYearChange?: (year: number) => void;
+	onTimeMapSourceChange?: (name: string) => void;
+	/** When false, do not show the `year` control. */
+	showYear?: boolean;
+	/** When false, do not show the `timeMapSourceName` control. */
+	showTimeMapSource?: boolean;
 }
 
 export interface HistoryMapConfigPaneHandle {
@@ -40,8 +44,16 @@ export interface HistoryMapConfigPaneHandle {
 export function mountHistoryMapConfigPane(
 	opts: MountHistoryMapConfigPaneOptions,
 ): HistoryMapConfigPaneHandle {
-	const { host, map, mapElement, binding, onYearChange, onTimeMapSourceChange } =
-		opts;
+	const {
+		host,
+		map,
+		mapElement,
+		binding,
+		onYearChange,
+		onTimeMapSourceChange,
+		showYear,
+		showTimeMapSource,
+	} = opts;
 
 	const pane = new Pane({ container: host, title: "Map" });
 
@@ -103,22 +115,32 @@ export function mountHistoryMapConfigPane(
 		});
 
 	const dataFolder = pane.addFolder({ title: "Data", expanded: false });
-	dataFolder
-		.addBinding(binding, "year", {
-			min: -5000,
-			max: new Date().getFullYear() + 100,
-			step: 1,
-		})
-		.on("change", () => {
-			onYearChange(binding.year);
-		});
-	dataFolder
-		.addBinding(binding, "timeMapSourceName", {
-			label: "time source",
-		})
-		.on("change", () => {
-			onTimeMapSourceChange(binding.timeMapSourceName.trim() || "timemap");
-		});
+	const shouldShowYear = showYear !== false;
+	const shouldShowTimeMapSource = showTimeMapSource !== false;
+
+	if (shouldShowYear) {
+		dataFolder
+			.addBinding(binding, "year", {
+				min: -5000,
+				max: new Date().getFullYear() + 100,
+				step: 1,
+			})
+			.on("change", () => {
+				onYearChange?.(binding.year);
+			});
+	}
+
+	if (shouldShowTimeMapSource) {
+		dataFolder
+			.addBinding(binding, "timeMapSourceName", {
+				label: "time source",
+			})
+			.on("change", () => {
+				onTimeMapSourceChange?.(
+					binding.timeMapSourceName.trim() || "timemap",
+				);
+			});
+	}
 
 	/**
 	 * Sync lat/lng/zoom from the map into the pane.

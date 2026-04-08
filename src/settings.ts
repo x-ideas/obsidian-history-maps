@@ -17,10 +17,16 @@ export interface TileSet {
 
 export interface MapSettings {
 	tileSets: TileSet[];
+	/** Bases History Map: on-map Tweakpane (view / year / time source). */
+	showBasesMapConfigPane: boolean;
+	/** Default vector source name used by year filtering (e.g. `timemap`). */
+	defaultTimeMapSourceName: string;
 }
 
 export const DEFAULT_SETTINGS: MapSettings = {
 	tileSets: [],
+	showBasesMapConfigPane: true,
+	defaultTimeMapSourceName: "timemap",
 };
 
 class TileSetModal extends Modal {
@@ -122,6 +128,36 @@ export class MapSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
+
+		new Setting(containerEl)
+			.setName("Show map debug panel")
+			.setDesc(
+				"When enabled, Bases History Map views show a small panel (center, zoom, year, vector time source).",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.showBasesMapConfigPane)
+					.onChange(async (v) => {
+						this.plugin.settings.showBasesMapConfigPane = v;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Default time map source name")
+			.setDesc(
+				'Vector source id used for year filtering (default: "timemap").',
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("timemap")
+					.setValue(this.plugin.settings.defaultTimeMapSourceName || "timemap")
+					.onChange(async (v) => {
+						this.plugin.settings.defaultTimeMapSourceName =
+							v.trim() || "timemap";
+						await this.plugin.saveSettings();
+					}),
+			);
 
 		new Setting(containerEl)
 			.setHeading()

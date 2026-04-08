@@ -2,10 +2,9 @@ import type ObsidianHistoryMapsPlugin from "../main";
 import { StyleManager } from "../map/style";
 import { DEFAULT_MAP_CENTER, DEFAULT_MAP_ZOOM } from "../map/constants";
 import { applyYearFilter } from "../map/year-filter";
-import { rtlPluginCode } from "../map/rtl-plugin-code";
+import { ensureMaplibreGlobalInit } from "../map/maplibre-global-init";
 import { disposeMapTimeline } from "../map/timeline";
-import maplibregl, { Map, setRTLTextPlugin } from "maplibre-gl";
-import { Protocol } from "pmtiles";
+import { Map } from "maplibre-gl";
 import {
 	ApiPointsLayer,
 	type HistoryMapPoint,
@@ -68,9 +67,6 @@ export interface RenderHistoryMapResult {
 	setPoints: (points: HistoryMapPoint[]) => Promise<void>;
 }
 
-let pmtilesProtocolRegistered = false;
-let rtlPluginInitialized = false;
-
 /** API embed uses a fixed year span until timeline options are implemented. */
 const API_YEAR_RANGE_LO = -3000;
 
@@ -96,26 +92,6 @@ function clampConfigurableYear(
 	const n = year == null ? Number.NaN : Number.parseInt(String(year), 10);
 	const base = Number.isFinite(n) ? n : fb;
 	return clampYear(base, lo, hi);
-}
-
-function ensureMaplibreProtocol(): void {
-	if (pmtilesProtocolRegistered) return;
-	maplibregl.addProtocol("pmtiles", new Protocol().tile);
-	pmtilesProtocolRegistered = true;
-}
-
-function ensureRtlPlugin(): void {
-	if (rtlPluginInitialized) return;
-	try {
-		const blob = new Blob([rtlPluginCode], {
-			type: "application/javascript",
-		});
-		const blobURL = URL.createObjectURL(blob);
-		setRTLTextPlugin(blobURL, false);
-		rtlPluginInitialized = true;
-	} catch (e) {
-		console.warn("History maps API: RTL plugin init failed:", e);
-	}
 }
 
 function tileUrlsFromPlugin(plugin: ObsidianHistoryMapsPlugin): {
@@ -145,15 +121,17 @@ export async function renderHistoryMap(
 	container: HTMLElement,
 	options: RenderHistoryMapOptions = {},
 ): Promise<RenderHistoryMapResult> {
-	ensureMaplibreProtocol();
-	ensureRtlPlugin();
+	ensureMaplibreGlobalInit();
 
 	const center = options.center ?? DEFAULT_MAP_CENTER;
 	const zoom = options.zoom ?? DEFAULT_MAP_ZOOM;
 	const minZ = options.minZoom ?? 1;
 	const maxZ = options.maxZoom ?? 18;
 	const heightPx = options.height ?? 600;
-	let timeSrc = options.timeMapSourceName?.trim() || "timemap";
+	let timeSrc =
+		options.timeMapSourceName?.trim() ||
+		plugin.settings.defaultTimeMapSourceName?.trim() ||
+		"timemap";
 	const showTweakpane = options.showTweakpane !== false;
 
 	const tLo = API_YEAR_RANGE_LO;

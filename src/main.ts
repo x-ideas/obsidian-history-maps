@@ -1,5 +1,6 @@
 import "./app.css";
 import { Plugin } from "obsidian";
+import { ensureMaplibreGlobalInit } from "./map/maplibre-global-init";
 import { HistoryMapView } from "./map-view";
 import { MapSettings, DEFAULT_SETTINGS, MapSettingTab } from "./settings";
 import {
@@ -20,6 +21,7 @@ export default class ObsidianHistoryMapsPlugin extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
+		ensureMaplibreGlobalInit();
 
 		this.registerBasesView("history-map", {
 			name: "History Map",

@@ -4,14 +4,15 @@ import {
 	createCompositeMarkerImage,
 	getMarkerCompositeImageKey,
 } from "../map/markers";
+import { parseCoordinate, verifyLatLng } from "../map/utils";
 
 const SOURCE_ID = "ohm-api-markers";
 const LAYER_ID = "ohm-api-marker-pins";
 
 export interface HistoryMapPoint {
 	id?: string;
-	latitude: number;
-	longitude: number;
+	/** Same data model as Bases map view: `[lat, lng]` array or `"lat,lng"` string. */
+	coordinates: unknown;
 	title?: string;
 	/** Lucide icon id (same as Bases marker icon property), e.g. `"map-pin"`. */
 	icon?: string;
@@ -37,14 +38,37 @@ export type HistoryMapPointClickHandler = (
 	event: MapLayerMouseEvent,
 ) => void;
 
+function coordinateFromHistoryMapPoint(
+	coordinates: unknown,
+): [number, number] | null {
+	let lat: number | null = null;
+	let lng: number | null = null;
+
+	if (Array.isArray(coordinates) && coordinates.length >= 2) {
+		lat = parseCoordinate(coordinates[0]);
+		lng = parseCoordinate(coordinates[1]);
+	} else if (typeof coordinates === "string") {
+		const parts = coordinates.trim().split(",");
+		if (parts.length >= 2) {
+			lat = parseCoordinate(parts[0].trim());
+			lng = parseCoordinate(parts[1].trim());
+		}
+	}
+
+	if (lat != null && lng != null && verifyLatLng(lat, lng)) {
+		return [lat, lng];
+	}
+	return null;
+}
+
 function filterPointsByTimelineYear(
 	points: HistoryMapPoint[],
 	timelineYear: number,
 ): HistoryMapPoint[] {
-	const y = Math.trunc(timelineYear);
+	const y = Math.trunc(Number.parseInt(String(timelineYear), 10));
 	return points.filter((p) => {
-		if (p.year == null || !Number.isFinite(p.year)) {
-			return true;
+		if (p.year == null) {
+			return false;
 		}
 		return Math.trunc(p.year) === y;
 	});
@@ -54,6 +78,7 @@ export class ApiPointsLayer {
 	private loadedIcons = new Set<string>();
 	private rawPoints: HistoryMapPoint[] = [];
 	private visiblePoints: HistoryMapPoint[] = [];
+	private visibleCoords: Array<[number, number]> = [];
 	private popup: Popup | null = null;
 	private handlersAttached = false;
 	private mapForHandlers: Map | null = null;
@@ -64,10 +89,23 @@ export class ApiPointsLayer {
 		private readonly onPointClick?: HistoryMapPointClickHandler,
 	) {}
 
+	private getPointIndex(e: MapLayerMouseEvent): number | null {
+		const feature = e.features?.[0];
+		const raw = feature?.properties?.pointIndex;
+		if (typeof raw === "number" && Number.isFinite(raw)) {
+			return raw;
+		}
+		if (typeof raw === "string") {
+			const n = Number.parseInt(raw, 10);
+			return Number.isFinite(n) ? n : null;
+		}
+		return null;
+	}
+
 	private getPoint(e: MapLayerMouseEvent): HistoryMapPoint | null {
 		const feature = e.features?.[0];
-		const idx = feature?.properties?.pointIndex;
-		if (typeof idx !== "number" || !this.visiblePoints[idx]) {
+		const idx = this.getPointIndex(e);
+		if (idx == null || !this.visiblePoints[idx]) {
 			return null;
 		}
 		return this.visiblePoints[idx];
@@ -76,8 +114,10 @@ export class ApiPointsLayer {
 	private readonly onPinEnter = (e: MapLayerMouseEvent): void => {
 		this.mapForHandlers?.getCanvas().style.setProperty("cursor", "pointer");
 		const p = this.getPoint(e);
-		if (p && this.mapForHandlers) {
-			this.showPopup(this.mapForHandlers, p, [p.longitude, p.latitude]);
+		const idx = this.getPointIndex(e);
+		const coord = idx == null ? null : this.visibleCoords[idx];
+		if (p && coord && this.mapForHandlers) {
+			this.showPopup(this.mapForHandlers, p, coord);
 		}
 	};
 
@@ -98,10 +138,12 @@ export class ApiPointsLayer {
 	private readonly onPinClick = (e: MapLayerMouseEvent): void => {
 		const p = this.getPoint(e);
 		if (!p) return;
+
 		if (this.onPointClick) {
 			this.onPointClick(p, e);
 		} else {
 			const path = p.file?.path ?? p.linkPath;
+
 			if (path) {
 				const newLeaf = Boolean(
 					e.originalEvent && Keymap.isModEvent(e.originalEvent),
@@ -154,11 +196,12 @@ export class ApiPointsLayer {
 		wrap.className = "bases-map-popup";
 		const titleEl = document.createElement("div");
 		titleEl.className = "bases-map-popup-title";
+		const latLng = coordinateFromHistoryMapPoint(point.coordinates);
+		const fallbackTitle = latLng
+			? `${latLng[0].toFixed(4)}, ${latLng[1].toFixed(4)}`
+			: String(point.coordinates);
 		titleEl.textContent =
-			point.title ||
-			point.file?.basename ||
-			point.id ||
-			`${point.latitude.toFixed(4)}, ${point.longitude.toFixed(4)}`;
+			point.title || point.file?.basename || point.id || fallbackTitle;
 		wrap.appendChild(titleEl);
 
 		const props = point.properties;
@@ -214,15 +257,25 @@ export class ApiPointsLayer {
 	}
 
 	private buildFeatures(points: HistoryMapPoint[]): GeoJSON.Feature[] {
-		this.visiblePoints = points;
-		return points.map((p, i) => {
+		const normalized: Array<{ p: HistoryMapPoint; coord: [number, number] }> =
+			[];
+		for (const p of points) {
+			const latLng = coordinateFromHistoryMapPoint(p.coordinates);
+			if (!latLng) continue;
+			normalized.push({ p, coord: [latLng[1], latLng[0]] }); // MapLibre GeoJSON uses [lng, lat]
+		}
+
+		this.visiblePoints = normalized.map((x) => x.p);
+		this.visibleCoords = normalized.map((x) => x.coord);
+
+		return normalized.map(({ p, coord }, i) => {
 			const icon = p.icon?.trim() || null;
 			const color = p.color?.trim() || "var(--bases-map-marker-background)";
 			return {
 				type: "Feature",
 				geometry: {
 					type: "Point",
-					coordinates: [p.longitude, p.latitude],
+					coordinates: coord,
 				},
 				properties: {
 					pointIndex: i,
@@ -284,10 +337,6 @@ export class ApiPointsLayer {
 		this.rawPoints = points;
 		const visible = filterPointsByTimelineYear(points, timelineYear);
 
-		console.log("setPoints", {
-			points,
-			visiblePoints: visible,
-		});
 		this.ensureSourceAndLayer(map);
 		await this.loadImages(map, visible);
 

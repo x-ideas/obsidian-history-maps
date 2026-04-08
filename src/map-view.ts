@@ -10,7 +10,7 @@ import {
 	BasesAllOptions,
 	BasesViewConfig,
 } from "obsidian";
-import { LngLatLike, Map, setRTLTextPlugin } from "maplibre-gl";
+import { LngLatLike, Map } from "maplibre-gl";
 
 import type ObsidianHistoryMapsPlugin from "./main";
 import {
@@ -24,14 +24,18 @@ import { StyleManager } from "./map/style";
 import { PopupManager } from "./map/popup";
 import { MarkerManager } from "./map/markers";
 import { hasOwnProperty, coordinateFromValue } from "./map/utils";
-import { rtlPluginCode } from "./map/rtl-plugin-code";
+import { ensureMaplibreGlobalInit } from "./map/maplibre-global-init";
 import { disposeMapTimeline } from "./map/timeline";
 import { applyYearFilter } from "./map/year-filter";
+import {
+	mountHistoryMapConfigPane,
+	type HistoryMapConfigBinding,
+	type HistoryMapConfigPaneHandle,
+} from "./api/history-map-config-pane";
 
 interface MapConfig {
-	year: number | null;
-	timeMapSourceName: string | null;
-	showTimeline: boolean | null;
+	/** Bases view option: `defaultYear` (stored as text / number depending on Bases). */
+	year: number | string | null;
 	/** Note property matched against timeline year for marker filtering. */
 	yearProperty: BasesPropertyId | null;
 
@@ -70,8 +74,14 @@ export class HistoryMapView extends BasesView {
 	private popupManager: PopupManager;
 	private markerManager: MarkerManager;
 
-	// Static flag to track RTL plugin initialization
-	private static rtlPluginInitialized = false;
+	/** Tweakpane (optional): see plugin setting `showBasesMapConfigPane`. */
+	private configPane: HistoryMapConfigPaneHandle | null = null;
+	private tweakBinding: HistoryMapConfigBinding | null = null;
+	private paneHostEl: HTMLElement | null = null;
+	/** Year applied to vector `timeMap` layers via {@link applyYearFilter}. */
+	private vectorFilterYear = new Date().getFullYear();
+	/** Vector time source name for {@link applyYearFilter} (pane-controlled). */
+	private vectorTimeMapSource = "timemap";
 
 	constructor(
 		controller: QueryController,
@@ -136,6 +146,97 @@ export class HistoryMapView extends BasesView {
 		}
 	};
 
+	private computeYearFromConfig(cfg: MapConfig): number {
+		const hi = new Date().getFullYear() + 100;
+		const lo = -5000;
+		const parsed =
+			cfg.year == null
+				? Number.NaN
+				: typeof cfg.year === "number"
+					? cfg.year
+					: Number.parseInt(String(cfg.year).trim(), 10);
+		const n = Number.isFinite(parsed)
+			? Math.trunc(parsed)
+			: new Date().getFullYear();
+		return Math.min(hi, Math.max(lo, n));
+	}
+
+	private syncVectorStateFromMapConfig(cfg: MapConfig): void {
+		this.vectorFilterYear = this.computeYearFromConfig(cfg);
+		if (this.tweakBinding) {
+			this.tweakBinding.year = this.vectorFilterYear;
+			this.configPane?.refreshPanel();
+		}
+	}
+
+	private applyVectorYearFilter(): void {
+		if (!this.map) return;
+		applyYearFilter(this.map, this.vectorFilterYear, this.vectorTimeMapSource);
+	}
+
+	private disposeConfigPane(): void {
+		this.configPane?.dispose();
+		this.configPane = null;
+		this.tweakBinding = null;
+		if (this.paneHostEl) {
+			this.paneHostEl.remove();
+			this.paneHostEl = null;
+		}
+		this.containerEl.removeClass("ohm-api-history-map-wrap");
+	}
+
+	private mountConfigPaneAfterMapCreated(): void {
+		if (!this.plugin.settings.showBasesMapConfigPane) return;
+		if (this.configPane || !this.map || !this.mapConfig) return;
+
+		this.containerEl.addClass("ohm-api-history-map-wrap");
+		this.paneHostEl = this.containerEl.createDiv({
+			cls: "ohm-api-tweakpane-host",
+		});
+
+		const c = this.map.getCenter();
+		this.vectorTimeMapSource =
+			this.plugin.settings.defaultTimeMapSourceName?.trim() || "timemap";
+		const binding: HistoryMapConfigBinding = {
+			latitude: c.lat,
+			longitude: c.lng,
+			zoom: this.map.getZoom(),
+			minZoom: this.mapConfig.minZoom,
+			maxZoom: this.mapConfig.maxZoom,
+			heightPx: this.mapConfig.mapHeight,
+			year: this.vectorFilterYear,
+			timeMapSourceName: this.vectorTimeMapSource,
+		};
+		this.tweakBinding = binding;
+
+		this.configPane = mountHistoryMapConfigPane({
+			host: this.paneHostEl,
+			map: this.map,
+			mapElement: this.mapEl,
+			binding,
+			showYear: true,
+			showTimeMapSource: true,
+			onYearChange: (y) => {
+				const hi = new Date().getFullYear() + 100;
+				const lo = -5000;
+				const clamped = Math.min(hi, Math.max(lo, Math.trunc(y)));
+				this.vectorFilterYear = clamped;
+				binding.year = clamped;
+				// Keep the view option in sync so future refreshes don't override it.
+				this.config.set("defaultYear", String(clamped));
+				if (this.mapConfig) {
+					this.mapConfig.year = String(clamped);
+				}
+				this.applyVectorYearFilter();
+			},
+			onTimeMapSourceChange: (name) => {
+				this.vectorTimeMapSource = name;
+				binding.timeMapSourceName = name;
+				this.applyVectorYearFilter();
+			},
+		});
+	}
+
 	private async updateMapStyle(): Promise<void> {
 		if (!this.map || !this.mapConfig) return;
 		const newStyle = await this.styleManager.getMapStyle(
@@ -176,22 +277,7 @@ export class HistoryMapView extends BasesView {
 			return;
 		}
 
-		// Initialize RTL text plugin once
-		if (!HistoryMapView.rtlPluginInitialized) {
-			try {
-				// Create a blob URL from the bundled RTL plugin code
-				// The plugin needs to run in a worker context
-				const blob = new Blob([rtlPluginCode], {
-					type: "application/javascript",
-				});
-				const blobURL = URL.createObjectURL(blob);
-				// Set lazy loading to false - plugin is initialized since code is already bundled
-				setRTLTextPlugin(blobURL, false);
-				HistoryMapView.rtlPluginInitialized = true;
-			} catch (error) {
-				console.warn("Failed to initialize RTL text plugin:", error);
-			}
-		}
+		ensureMaplibreGlobalInit();
 
 		// Load config first
 		const currentTileSetId = this.mapConfig?.currentTileSetId || null;
@@ -250,9 +336,13 @@ export class HistoryMapView extends BasesView {
 			maxZoom: this.mapConfig.maxZoom,
 		});
 
+		this.syncVectorStateFromMapConfig(this.mapConfig);
+
 		// Set map reference in managers
 		this.popupManager.setMap(this.map);
 		this.markerManager.setMap(this.map);
+
+		this.mountConfigPaneAfterMapCreated();
 
 		this.map.addControl(new CustomZoomControl(), "top-right");
 
@@ -282,37 +372,41 @@ export class HistoryMapView extends BasesView {
 		this.map.on("load", () => {
 			if (!this.map || !this.mapConfig) return;
 
-			// If we were restoring state, do not reset to defaults
-			if (isRestoringState || this.pendingMapState) return;
+			const skipDefaultCenterZoom = isRestoringState || this.pendingMapState;
 
-			const hasConfiguredCenter =
-				this.mapConfig.center[0] !== 0 || this.mapConfig.center[1] !== 0;
-			const hasConfiguredZoom =
-				this.config.get("defaultZoom") &&
-				Number.isNumber(this.config.get("defaultZoom"));
+			if (!skipDefaultCenterZoom) {
+				const hasConfiguredCenter =
+					this.mapConfig.center[0] !== 0 || this.mapConfig.center[1] !== 0;
+				const hasConfiguredZoom =
+					this.config.get("defaultZoom") &&
+					Number.isNumber(this.config.get("defaultZoom"));
 
-			// Set center based on configuration
-			if (hasConfiguredCenter) {
-				this.map.setCenter([
-					this.mapConfig.center[1],
-					this.mapConfig.center[0],
-				]); // MapLibre uses [lng, lat]
-			} else {
-				const bounds = this.markerManager.getBounds();
-				if (bounds) {
-					this.map.setCenter(bounds.getCenter()); // Center on markers
+				// Set center based on configuration
+				if (hasConfiguredCenter) {
+					this.map.setCenter([
+						this.mapConfig.center[1],
+						this.mapConfig.center[0],
+					]); // MapLibre uses [lng, lat]
+				} else {
+					const bounds = this.markerManager.getBounds();
+					if (bounds) {
+						this.map.setCenter(bounds.getCenter()); // Center on markers
+					}
+				}
+
+				// Set zoom based on configuration
+				if (hasConfiguredZoom) {
+					this.map.setZoom(this.mapConfig.defaultZoom); // Use configured zoom
+				} else {
+					const bounds = this.markerManager.getBounds();
+					if (bounds) {
+						this.map.fitBounds(bounds, { padding: 20 }); // Fit all markers
+					}
 				}
 			}
 
-			// Set zoom based on configuration
-			if (hasConfiguredZoom) {
-				this.map.setZoom(this.mapConfig.defaultZoom); // Use configured zoom
-			} else {
-				const bounds = this.markerManager.getBounds();
-				if (bounds) {
-					this.map.fitBounds(bounds, { padding: 20 }); // Fit all markers
-				}
-			}
+			this.applyVectorYearFilter();
+			this.configPane?.refreshViewFromMap();
 		});
 
 		// Hide tooltip on the map element.
@@ -329,6 +423,7 @@ export class HistoryMapView extends BasesView {
 
 	private destroyMap(): void {
 		disposeMapTimeline(this.containerEl);
+		this.disposeConfigPane();
 		this.popupManager.destroy();
 		if (this.map) {
 			this.map.remove();
@@ -345,6 +440,11 @@ export class HistoryMapView extends BasesView {
 
 		const currentTileSetId = this.mapConfig?.currentTileSetId || null;
 		this.mapConfig = this.loadConfig(currentTileSetId);
+
+		if (this.map && this.mapConfig) {
+			this.syncVectorStateFromMapConfig(this.mapConfig);
+			this.applyVectorYearFilter();
+		}
 
 		// Check if the evaluated center coordinates have changed
 		const centerChanged =
@@ -383,6 +483,7 @@ export class HistoryMapView extends BasesView {
 						this.map.setZoom(zoom);
 					}
 					this.pendingMapState = null;
+					this.configPane?.refreshViewFromMap();
 				}
 			}
 
@@ -501,6 +602,13 @@ export class HistoryMapView extends BasesView {
 			// Resize map after height changes
 			this.map.resize();
 		}
+
+		if (this.tweakBinding && this.mapConfig) {
+			this.tweakBinding.minZoom = this.mapConfig.minZoom;
+			this.tweakBinding.maxZoom = this.mapConfig.maxZoom;
+			this.tweakBinding.heightPx = this.mapConfig.mapHeight;
+		}
+		this.configPane?.refreshViewFromMap();
 	}
 
 	isEmbedded(): boolean {
@@ -580,9 +688,7 @@ export class HistoryMapView extends BasesView {
 		}
 
 		return {
-			year: this.config.get("year") as number | null,
-			timeMapSourceName: this.config.get("timeMapSourceName") as string | null,
-			showTimeline: this.config.get("showTimeline") as boolean | null,
+			year: this.config.get("defaultYear") as number | string | null,
 			yearProperty,
 
 			coordinatesProp,
@@ -671,9 +777,7 @@ export class HistoryMapView extends BasesView {
 			mapHeight: this.config.get("mapHeight"),
 			mapTiles: this.config.get("mapTiles"),
 			mapTilesDark: this.config.get("mapTilesDark"),
-			year: this.config.get("year"),
-			timeMapSourceName: this.config.get("timeMapSourceName"),
-			showTimeline: this.config.get("showTimeline"),
+			year: this.config.get("defaultYear"),
 			yearProperty: this.config.get("yearProperty"),
 		});
 	}
@@ -820,14 +924,12 @@ export class HistoryMapView extends BasesView {
 						displayName: "Year property",
 						type: "property",
 						key: "yearProperty",
-						placeholder: "start",
 					},
 					{
 						displayName: "Center coordinates",
 						type: "formula",
 						key: "center",
 						placeholder: "[latitude, longitude]",
-						default: "[39.9042,116.4074]",
 					},
 					{
 						displayName: "Default zoom",
