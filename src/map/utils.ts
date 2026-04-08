@@ -1,4 +1,11 @@
-import { Value, NumberValue, StringValue, ListValue } from 'obsidian';
+import {
+	Value,
+	NumberValue,
+	StringValue,
+	ListValue,
+	NullValue,
+	DateValue,
+} from "obsidian";
 
 /**
  * Converts a Value to coordinate tuple [lat, lng]
@@ -65,5 +72,45 @@ export function parseCoordinate(value: unknown): number | null {
  */
 export function hasOwnProperty<K extends PropertyKey>(o: unknown, v: K): o is Record<K, unknown> {
 	return o != null && typeof o === 'object' && Object.hasOwn(o, v);
+}
+
+/**
+ * Reads a calendar year from a Bases {@link Value} (number, text, ISO date string, etc.).
+ */
+export function yearFromValue(value: Value | null): number | null {
+	if (value == null) {
+		return null;
+	}
+	if (value instanceof NullValue) {
+		return null;
+	}
+	if (value instanceof NumberValue) {
+		const n = Number(value.toString());
+		return Number.isFinite(n) ? Math.trunc(n) : null;
+	}
+	if (value instanceof DateValue) {
+		const s = value.toString().trim();
+		const y = Number.parseInt(s.slice(0, 4), 10);
+		return Number.isFinite(y) ? y : null;
+	}
+	if (value instanceof StringValue) {
+		const s = value.toString().trim();
+		const m = s.match(/^(-?\d{1,4})/);
+		if (m) {
+			const n = Number.parseInt(m[1], 10);
+			return Number.isFinite(n) ? n : null;
+		}
+	}
+	try {
+		const s = value.toString().trim();
+		const m = s.match(/^(-?\d{1,4})/);
+		if (m) {
+			const n = Number.parseInt(m[1], 10);
+			return Number.isFinite(n) ? n : null;
+		}
+	} catch {
+		/* ignore */
+	}
+	return null;
 }
 

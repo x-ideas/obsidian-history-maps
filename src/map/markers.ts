@@ -4,6 +4,111 @@ import { MapMarker, MapMarkerProperties } from './types';
 import { coordinateFromValue } from './utils';
 import { PopupManager } from './popup';
 
+export function getMarkerCompositeImageKey(
+	icon: string | null,
+	color: string,
+): string {
+	return `marker-${icon || 'dot'}-${color.replace(/[^a-zA-Z0-9]/g, '')}`;
+}
+
+function resolveMarkerCssColor(color: string): string {
+	const tempEl = document.createElement('div');
+	tempEl.style.color = color;
+	tempEl.style.display = 'none';
+	document.body.appendChild(tempEl);
+	const computedColor = getComputedStyle(tempEl).color;
+	tempEl.remove();
+	return computedColor;
+}
+
+/** Shared with the plugin API points layer for MapLibre symbol images. */
+export async function createCompositeMarkerImage(
+	icon: string | null,
+	color: string,
+): Promise<HTMLImageElement> {
+	const resolvedColor = resolveMarkerCssColor(color);
+	const resolvedIconColor = resolveMarkerCssColor('var(--bases-map-marker-icon-color)');
+
+	const scale = 4;
+	const size = 48 * scale;
+	const canvas = document.createElement('canvas');
+	canvas.width = size;
+	canvas.height = size;
+	const ctx = canvas.getContext('2d');
+
+	if (!ctx) {
+		throw new Error('Failed to get canvas context');
+	}
+
+	ctx.imageSmoothingEnabled = true;
+	ctx.imageSmoothingQuality = 'high';
+
+	const centerX = size / 2;
+	const centerY = size / 2;
+	const radius = 12 * scale;
+
+	ctx.fillStyle = resolvedColor;
+	ctx.beginPath();
+	ctx.arc(centerX, centerY, radius, 0, 2 * Math.PI);
+	ctx.fill();
+
+	ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+	ctx.lineWidth = 1 * scale;
+	ctx.stroke();
+
+	if (icon) {
+		const iconDiv = document.createElement("div");
+		setIcon(iconDiv, icon);
+		const svgEl = iconDiv.querySelector('svg');
+
+		if (svgEl) {
+			svgEl.setAttribute('stroke', 'currentColor');
+			svgEl.setAttribute('fill', 'none');
+			svgEl.setAttribute('stroke-width', '2');
+			svgEl.style.color = resolvedIconColor;
+
+			const svgString = new XMLSerializer().serializeToString(svgEl);
+			const iconImg = new Image();
+			iconImg.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgString);
+
+			await new Promise<void>((resolve, reject) => {
+				iconImg.onload = () => {
+					const iconSize = radius * 1.2;
+					ctx.drawImage(
+						iconImg,
+						centerX - iconSize / 2,
+						centerY - iconSize / 2,
+						iconSize,
+						iconSize,
+					);
+					resolve();
+				};
+				iconImg.onerror = reject;
+			});
+		}
+	} else {
+		const dotRadius = 4 * scale;
+		ctx.fillStyle = resolvedIconColor;
+		ctx.beginPath();
+		ctx.arc(centerX, centerY, dotRadius, 0, 2 * Math.PI);
+		ctx.fill();
+	}
+
+	return new Promise((resolve, reject) => {
+		canvas.toBlob((blob) => {
+			if (!blob) {
+				reject(new Error('Failed to create image blob'));
+				return;
+			}
+
+			const img = new Image();
+			img.onload = () => resolve(img);
+			img.onerror = reject;
+			img.src = URL.createObjectURL(blob);
+		});
+	});
+}
+
 export class MarkerManager {
 	private map: Map | null = null;
 	private app: App;
@@ -203,116 +308,15 @@ export class MarkerManager {
 	}
 
 	private getCompositeImageKey(icon: string | null, color: string): string {
-		return `marker-${icon || 'dot'}-${color.replace(/[^a-zA-Z0-9]/g, '')}`;
+		return getMarkerCompositeImageKey(icon, color);
 	}
 
 	private resolveColor(color: string): string {
-		// Create a temporary element to resolve CSS variables
-		const tempEl = document.createElement('div');
-		tempEl.style.color = color;
-		tempEl.style.display = 'none';
-		document.body.appendChild(tempEl);
-
-		// Get the computed color value
-		const computedColor = getComputedStyle(tempEl).color;
-
-		// Clean up
-		tempEl.remove();
-
-		return computedColor;
+		return resolveMarkerCssColor(color);
 	}
 
 	private async createCompositeMarkerImage(icon: string | null, color: string): Promise<HTMLImageElement> {
-		// Resolve CSS variables to actual color values
-		const resolvedColor = this.resolveColor(color);
-		const resolvedIconColor = this.resolveColor('var(--bases-map-marker-icon-color)');
-
-		// Create a high-resolution canvas for crisp rendering on retina displays
-		const scale = 4; // 4x resolution for crisp display
-		const size = 48 * scale; // High-res canvas
-		const canvas = document.createElement('canvas');
-		canvas.width = size;
-		canvas.height = size;
-		const ctx = canvas.getContext('2d');
-
-		if (!ctx) {
-			throw new Error('Failed to get canvas context');
-		}
-
-		// Enable high-quality rendering
-		ctx.imageSmoothingEnabled = true;
-		ctx.imageSmoothingQuality = 'high';
-
-		// Draw the circle background (scaled up)
-		const centerX = size / 2;
-		const centerY = size / 2;
-		const radius = 12 * scale;
-
-		ctx.fillStyle = resolvedColor;
-		ctx.beginPath();
-		ctx.arc(centerX, centerY, radius, 0, 2 * Math.PI);
-		ctx.fill();
-
-		ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-		ctx.lineWidth = 1 * scale;
-		ctx.stroke();
-
-		// Draw the icon or dot
-		if (icon) {
-			// Load and draw custom icon
-			const iconDiv = createDiv();
-			setIcon(iconDiv, icon);
-			const svgEl = iconDiv.querySelector('svg');
-
-			if (svgEl) {
-				svgEl.setAttribute('stroke', 'currentColor');
-				svgEl.setAttribute('fill', 'none');
-				svgEl.setAttribute('stroke-width', '2');
-				svgEl.style.color = resolvedIconColor;
-
-				const svgString = new XMLSerializer().serializeToString(svgEl);
-				const iconImg = new Image();
-				iconImg.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgString);
-
-				await new Promise<void>((resolve, reject) => {
-					iconImg.onload = () => {
-						// Draw icon centered and scaled
-						const iconSize = radius * 1.2;
-						ctx.drawImage(
-							iconImg,
-							centerX - iconSize / 2,
-							centerY - iconSize / 2,
-							iconSize,
-							iconSize
-						);
-						resolve();
-					};
-					iconImg.onerror = reject;
-				});
-			}
-		} else {
-			// Draw a dot
-			const dotRadius = 4 * scale;
-			ctx.fillStyle = resolvedIconColor;
-			ctx.beginPath();
-			ctx.arc(centerX, centerY, dotRadius, 0, 2 * Math.PI);
-			ctx.fill();
-		}
-
-		// Convert canvas to image
-		return new Promise((resolve, reject) => {
-			canvas.toBlob((blob) => {
-				if (!blob) {
-					reject(new Error('Failed to create image blob'));
-					return;
-				}
-
-				const img = new Image();
-				img.onload = () => resolve(img);
-				img.onerror = reject;
-				img.src = URL.createObjectURL(blob);
-			});
-		});
+		return createCompositeMarkerImage(icon, color);
 	}
 
 	private createGeoJSONFeatures(markers: MapMarker[]): GeoJSON.Feature[] {

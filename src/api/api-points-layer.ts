@@ -1,0 +1,330 @@
+import { App, Keymap, TFile } from "obsidian";
+import { Map, Popup, MapLayerMouseEvent, GeoJSONSource } from "maplibre-gl";
+import {
+	createCompositeMarkerImage,
+	getMarkerCompositeImageKey,
+} from "../map/markers";
+
+const SOURCE_ID = "ohm-api-markers";
+const LAYER_ID = "ohm-api-marker-pins";
+
+export interface HistoryMapPoint {
+	id?: string;
+	latitude: number;
+	longitude: number;
+	title?: string;
+	/** Lucide icon id (same as Bases marker icon property), e.g. `"map-pin"`. */
+	icon?: string;
+	/** CSS color; defaults to `var(--bases-map-marker-background)`. */
+	color?: string;
+	/**
+	 * When set, only points with this year (or no `year`) show for the active
+	 * timeline year — same rule as Bases map marker filtering.
+	 */
+	year?: number;
+	properties?: Record<string, string | number | boolean | null | undefined>;
+	/**
+	 * If set (and no custom click handler on the layer), default click opens
+	 * this note via {@link Workspace.openLinkText} (modifier opens in new leaf).
+	 */
+	file?: TFile;
+	/** If set, used when {@link file} is absent; same open behavior as for files. */
+	linkPath?: string;
+}
+
+export type HistoryMapPointClickHandler = (
+	point: HistoryMapPoint,
+	event: MapLayerMouseEvent,
+) => void;
+
+function filterPointsByTimelineYear(
+	points: HistoryMapPoint[],
+	timelineYear: number,
+): HistoryMapPoint[] {
+	const y = Math.trunc(timelineYear);
+	return points.filter((p) => {
+		if (p.year == null || !Number.isFinite(p.year)) {
+			return true;
+		}
+		return Math.trunc(p.year) === y;
+	});
+}
+
+export class ApiPointsLayer {
+	private loadedIcons = new Set<string>();
+	private rawPoints: HistoryMapPoint[] = [];
+	private visiblePoints: HistoryMapPoint[] = [];
+	private popup: Popup | null = null;
+	private handlersAttached = false;
+	private mapForHandlers: Map | null = null;
+	private hideTimer: number | null = null;
+
+	constructor(
+		private readonly app: App,
+		private readonly onPointClick?: HistoryMapPointClickHandler,
+	) {}
+
+	private getPoint(e: MapLayerMouseEvent): HistoryMapPoint | null {
+		const feature = e.features?.[0];
+		const idx = feature?.properties?.pointIndex;
+		if (typeof idx !== "number" || !this.visiblePoints[idx]) {
+			return null;
+		}
+		return this.visiblePoints[idx];
+	}
+
+	private readonly onPinEnter = (e: MapLayerMouseEvent): void => {
+		this.mapForHandlers?.getCanvas().style.setProperty("cursor", "pointer");
+		const p = this.getPoint(e);
+		if (p && this.mapForHandlers) {
+			this.showPopup(this.mapForHandlers, p, [p.longitude, p.latitude]);
+		}
+	};
+
+	private readonly onPinLeave = (): void => {
+		this.mapForHandlers?.getCanvas().style.removeProperty("cursor");
+		const win = this.mapForHandlers?.getCanvas().ownerDocument.defaultView;
+		if (this.hideTimer != null && win) {
+			win.clearTimeout(this.hideTimer);
+		}
+		if (win) {
+			this.hideTimer = win.setTimeout(() => {
+				this.popup?.remove();
+				this.hideTimer = null;
+			}, 150);
+		}
+	};
+
+	private readonly onPinClick = (e: MapLayerMouseEvent): void => {
+		const p = this.getPoint(e);
+		if (!p) return;
+		if (this.onPointClick) {
+			this.onPointClick(p, e);
+		} else {
+			const path = p.file?.path ?? p.linkPath;
+			if (path) {
+				const newLeaf = Boolean(
+					e.originalEvent && Keymap.isModEvent(e.originalEvent),
+				);
+				void this.app.workspace.openLinkText(path, "", newLeaf);
+			}
+		}
+	};
+
+	private attachHandlers(map: Map): void {
+		if (this.handlersAttached) return;
+		this.handlersAttached = true;
+		this.mapForHandlers = map;
+		map.on("mouseenter", LAYER_ID, this.onPinEnter);
+		map.on("mouseleave", LAYER_ID, this.onPinLeave);
+		map.on("click", LAYER_ID, this.onPinClick);
+	}
+
+	private showPopup(
+		map: Map,
+		point: HistoryMapPoint,
+		lngLat: [number, number],
+	): void {
+		if (this.hideTimer != null) {
+			const win = map.getCanvas().ownerDocument.defaultView;
+			if (win) win.clearTimeout(this.hideTimer);
+			this.hideTimer = null;
+		}
+		if (!this.popup) {
+			this.popup = new Popup({
+				closeButton: false,
+				closeOnClick: false,
+				offset: 25,
+			});
+			this.popup.on("open", () => {
+				const el = this.popup?.getElement();
+				el?.addEventListener("mouseenter", () => {
+					const w = map.getCanvas().ownerDocument.defaultView;
+					if (w && this.hideTimer != null) {
+						w.clearTimeout(this.hideTimer);
+						this.hideTimer = null;
+					}
+				});
+				el?.addEventListener("mouseleave", () => {
+					this.onPinLeave();
+				});
+			});
+		}
+		const wrap = document.createElement("div");
+		wrap.className = "bases-map-popup";
+		const titleEl = document.createElement("div");
+		titleEl.className = "bases-map-popup-title";
+		titleEl.textContent =
+			point.title ||
+			point.file?.basename ||
+			point.id ||
+			`${point.latitude.toFixed(4)}, ${point.longitude.toFixed(4)}`;
+		wrap.appendChild(titleEl);
+
+		const props = point.properties;
+		if (props && Object.keys(props).length > 0) {
+			const list = document.createElement("div");
+			list.className = "bases-map-popup-properties";
+			for (const [k, v] of Object.entries(props)) {
+				if (v === undefined || v === null) continue;
+				const row = document.createElement("div");
+				row.className = "bases-map-popup-property";
+				const lab = document.createElement("div");
+				lab.className = "bases-map-popup-property-label";
+				lab.textContent = k;
+				const val = document.createElement("div");
+				val.className = "bases-map-popup-property-value";
+				val.textContent = String(v);
+				row.appendChild(lab);
+				row.appendChild(val);
+				list.appendChild(row);
+			}
+			wrap.appendChild(list);
+		}
+
+		this.popup.setDOMContent(wrap).setLngLat(lngLat).addTo(map);
+	}
+
+	private async loadImages(map: Map, points: HistoryMapPoint[]): Promise<void> {
+		const pending: Array<{ icon: string | null; color: string; key: string }> =
+			[];
+		const seen = new Set<string>();
+
+		for (const p of points) {
+			const icon = p.icon?.trim() || null;
+			const color = p.color?.trim() || "var(--bases-map-marker-background)";
+			const key = getMarkerCompositeImageKey(icon, color);
+			if (this.loadedIcons.has(key) || seen.has(key)) continue;
+			seen.add(key);
+			pending.push({ icon, color, key });
+		}
+
+		for (const { icon, color, key } of pending) {
+			try {
+				const img = await createCompositeMarkerImage(icon, color);
+				if (map.hasImage(key)) {
+					map.removeImage(key);
+				}
+				map.addImage(key, img);
+				this.loadedIcons.add(key);
+			} catch (e) {
+				console.warn("History maps API: marker image failed:", key, e);
+			}
+		}
+	}
+
+	private buildFeatures(points: HistoryMapPoint[]): GeoJSON.Feature[] {
+		this.visiblePoints = points;
+		return points.map((p, i) => {
+			const icon = p.icon?.trim() || null;
+			const color = p.color?.trim() || "var(--bases-map-marker-background)";
+			return {
+				type: "Feature",
+				geometry: {
+					type: "Point",
+					coordinates: [p.longitude, p.latitude],
+				},
+				properties: {
+					pointIndex: i,
+					icon: getMarkerCompositeImageKey(icon, color),
+				},
+			};
+		});
+	}
+
+	private ensureSourceAndLayer(map: Map): void {
+		if (map.getSource(SOURCE_ID)) {
+			return;
+		}
+
+		map.addSource(SOURCE_ID, {
+			type: "geojson",
+			data: { type: "FeatureCollection", features: [] },
+		});
+
+		map.addLayer({
+			id: LAYER_ID,
+			type: "symbol",
+			source: SOURCE_ID,
+			maxzoom: 18,
+			minzoom: 1,
+			layout: {
+				"icon-image": ["get", "icon"],
+				"icon-size": [
+					"interpolate",
+					["linear"],
+					["zoom"],
+					0,
+					0.12,
+					4,
+					0.18,
+					14,
+					0.22,
+					18,
+					0.24,
+				],
+				"icon-allow-overlap": true,
+				"icon-ignore-placement": true,
+				"icon-padding": 0,
+			},
+		});
+
+		this.attachHandlers(map);
+	}
+
+	async setPoints(
+		map: Map,
+		points: HistoryMapPoint[],
+		timelineYear: number,
+	): Promise<void> {
+		if (!map.getStyle()?.layers) {
+			return;
+		}
+
+		this.rawPoints = points;
+		const visible = filterPointsByTimelineYear(points, timelineYear);
+
+		console.log("setPoints", {
+			points,
+			visiblePoints: visible,
+		});
+		this.ensureSourceAndLayer(map);
+		await this.loadImages(map, visible);
+
+		const features = this.buildFeatures(visible);
+		const src = map.getSource(SOURCE_ID) as GeoJSONSource | undefined;
+		if (src) {
+			src.setData({ type: "FeatureCollection", features });
+		}
+	}
+
+	async refresh(map: Map, timelineYear: number): Promise<void> {
+		return this.setPoints(map, this.rawPoints, timelineYear);
+	}
+
+	detach(map: Map): void {
+		if (this.hideTimer != null) {
+			const win = map.getCanvas().ownerDocument.defaultView;
+			if (win) win.clearTimeout(this.hideTimer);
+			this.hideTimer = null;
+		}
+		this.popup?.remove();
+		this.popup = null;
+		if (this.handlersAttached) {
+			map.off("mouseenter", LAYER_ID, this.onPinEnter);
+			map.off("mouseleave", LAYER_ID, this.onPinLeave);
+			map.off("click", LAYER_ID, this.onPinClick);
+			this.handlersAttached = false;
+		}
+		this.mapForHandlers = null;
+		if (map.getLayer(LAYER_ID)) {
+			map.removeLayer(LAYER_ID);
+		}
+		if (map.getSource(SOURCE_ID)) {
+			map.removeSource(SOURCE_ID);
+		}
+		this.loadedIcons.clear();
+		this.visiblePoints = [];
+		this.rawPoints = [];
+	}
+}

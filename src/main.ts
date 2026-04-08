@@ -2,9 +2,21 @@ import "./app.css";
 import { Plugin } from "obsidian";
 import { HistoryMapView } from "./map-view";
 import { MapSettings, DEFAULT_SETTINGS, MapSettingTab } from "./settings";
+import {
+	renderHistoryMap,
+	type RenderHistoryMapOptions,
+} from "./api/render-history-map";
 
 export default class ObsidianHistoryMapsPlugin extends Plugin {
 	settings!: MapSettings;
+
+	/** Exposed for other plugins or custom code (see {@link renderHistoryMap}). */
+	api = {
+		renderHistoryMap: (
+			container: HTMLElement,
+			options?: RenderHistoryMapOptions,
+		) => renderHistoryMap(this, container, options),
+	};
 
 	async onload() {
 		await this.loadSettings();
@@ -28,6 +40,5 @@ export default class ObsidianHistoryMapsPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	onunload() {
-	}
+	onunload() {}
 }
