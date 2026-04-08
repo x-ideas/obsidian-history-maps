@@ -33,5 +33,9 @@
 		"maplibre-gl": "5.22.0",
 		"pmtiles": "^4.4.0",
 		"tweakpane": "^4.0.5"
-	}
+	},
+	"engines": {
+		"node": ">=24"
+	},
+	"packageManager": "pnpm@10.8.0"
 }
