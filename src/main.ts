@@ -1,18 +1,34 @@
-import { Plugin } from 'obsidian';
-import { MapView } from './map-view';
-import { MapSettings, DEFAULT_SETTINGS, MapSettingTab } from './settings';
+import "./app.css";
+import { Plugin } from "obsidian";
+import { ensureMaplibreGlobalInit } from "./map/maplibre-global-init";
+import { HistoryMapView } from "./map-view";
+import { MapSettings, DEFAULT_SETTINGS, MapSettingTab } from "./settings";
+import {
+	renderHistoryMap,
+	type RenderHistoryMapOptions,
+} from "./api/render-history-map";
 
-export default class ObsidianMapsPlugin extends Plugin {
-	settings: MapSettings;
+export default class ObsidianHistoryMapsPlugin extends Plugin {
+	settings!: MapSettings;
+
+	/** Exposed for other plugins or custom code (see {@link renderHistoryMap}). */
+	api = {
+		render: (
+			container: HTMLElement,
+			options?: RenderHistoryMapOptions,
+		) => renderHistoryMap(this, container, options),
+	};
 
 	async onload() {
 		await this.loadSettings();
+		ensureMaplibreGlobalInit();
 
-		this.registerBasesView('map', {
-			name: 'Map',
-			icon: 'lucide-map',
-			factory: (controller, containerEl) => new MapView(controller, containerEl, this),
-			options: MapView.getViewOptions,
+		this.registerBasesView("history-map", {
+			name: "History Map",
+			icon: "lucide-map",
+			factory: (controller, containerEl) =>
+				new HistoryMapView(controller, containerEl, this),
+			options: HistoryMapView.getViewOptions,
 		});
 
 		this.addSettingTab(new MapSettingTab(this.app, this));
@@ -26,6 +42,5 @@ export default class ObsidianMapsPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	onunload() {
-	}
+	onunload() {}
 }

@@ -7,20 +7,38 @@ import {
 	Value,
 	StringValue,
 	NullValue,
-	ViewOption,
-} from 'obsidian';
-import { LngLatLike, Map, setRTLTextPlugin } from 'maplibre-gl';
-import type ObsidianMapsPlugin from './main';
-import { DEFAULT_MAP_HEIGHT, DEFAULT_MAP_CENTER, DEFAULT_MAP_ZOOM } from './map/constants';
-import { CustomZoomControl } from './map/controls/zoom-control';
-import { BackgroundSwitcherControl } from './map/controls/background-switcher';
-import { StyleManager } from './map/style';
-import { PopupManager } from './map/popup';
-import { MarkerManager } from './map/markers';
-import { hasOwnProperty, coordinateFromValue } from './map/utils';
-import { rtlPluginCode } from './map/rtl-plugin-code';
+	BasesAllOptions,
+	BasesViewConfig,
+} from "obsidian";
+import { LngLatLike, Map } from "maplibre-gl";
+
+import type ObsidianHistoryMapsPlugin from "./main";
+import {
+	DEFAULT_MAP_HEIGHT,
+	DEFAULT_MAP_CENTER,
+	DEFAULT_MAP_ZOOM,
+} from "./map/constants";
+import { CustomZoomControl } from "./map/controls/zoom-control";
+import { BackgroundSwitcherControl } from "./map/controls/background-switcher";
+import { StyleManager } from "./map/style";
+import { PopupManager } from "./map/popup";
+import { MarkerManager } from "./map/markers";
+import { hasOwnProperty, coordinateFromValue } from "./map/utils";
+import { ensureMaplibreGlobalInit } from "./map/maplibre-global-init";
+import { disposeMapTimeline } from "./map/timeline";
+import { applyYearFilter } from "./map/year-filter";
+import {
+	mountHistoryMapConfigPane,
+	type HistoryMapConfigBinding,
+	type HistoryMapConfigPaneHandle,
+} from "./api/history-map-config-pane";
 
 interface MapConfig {
+	/** Bases view option: `defaultYear` (stored as text / number depending on Bases). */
+	year: number | string | null;
+	/** Note property matched against timeline year for marker filtering. */
+	yearProperty: BasesPropertyId | null;
+
 	coordinatesProp: BasesPropertyId | null;
 	markerIconProp: BasesPropertyId | null;
 	markerColorProp: BasesPropertyId | null;
@@ -34,19 +52,19 @@ interface MapConfig {
 	currentTileSetId: string | null;
 }
 
-export const MapViewType = 'map';
+export const MapViewType = "history-map";
 
-export class MapView extends BasesView {
+export class HistoryMapView extends BasesView {
 	type = MapViewType;
 	scrollEl: HTMLElement;
 	containerEl: HTMLElement;
 	mapEl: HTMLElement;
-	plugin: ObsidianMapsPlugin;
+	plugin: ObsidianHistoryMapsPlugin;
 
 	// Internal rendering data
 	private map: Map | null = null;
 	private mapConfig: MapConfig | null = null;
-	private pendingMapState: { center?: LngLatLike, zoom?: number } | null = null;
+	private pendingMapState: { center?: LngLatLike; zoom?: number } | null = null;
 	private isFirstLoad = true;
 	private lastConfigSnapshot: string | null = null;
 	private lastEvaluatedCenter: [number, number] = DEFAULT_MAP_CENTER;
@@ -56,15 +74,28 @@ export class MapView extends BasesView {
 	private popupManager: PopupManager;
 	private markerManager: MarkerManager;
 
-	// Static flag to track RTL plugin initialization
-	private static rtlPluginInitialized = false;
+	/** Tweakpane (optional): see plugin setting `showBasesMapConfigPane`. */
+	private configPane: HistoryMapConfigPaneHandle | null = null;
+	private tweakBinding: HistoryMapConfigBinding | null = null;
+	private paneHostEl: HTMLElement | null = null;
+	/** Year applied to vector `timeMap` layers via {@link applyYearFilter}. */
+	private vectorFilterYear = new Date().getFullYear();
+	/** Vector time source name for {@link applyYearFilter} (pane-controlled). */
+	private vectorTimeMapSource = "timemap";
 
-	constructor(controller: QueryController, scrollEl: HTMLElement, plugin: ObsidianMapsPlugin) {
+	constructor(
+		controller: QueryController,
+		scrollEl: HTMLElement,
+		plugin: ObsidianHistoryMapsPlugin,
+	) {
 		super(controller);
 		this.scrollEl = scrollEl;
 		this.plugin = plugin;
-		this.containerEl = scrollEl.createDiv({ cls: 'bases-map-container is-loading', attr: { tabIndex: 0 } });
-		this.mapEl = this.containerEl.createDiv('bases-map');
+		this.containerEl = scrollEl.createDiv({
+			cls: "bases-map-container is-loading",
+			attr: { tabIndex: 0 },
+		});
+		this.mapEl = this.containerEl.createDiv("bases-map");
 
 		// Initialize managers
 		this.styleManager = new StyleManager(this.app);
@@ -73,16 +104,19 @@ export class MapView extends BasesView {
 			this.app,
 			this.mapEl,
 			this.popupManager,
-			(path, newLeaf) => void this.app.workspace.openLinkText(path, '', newLeaf),
+			(path, newLeaf) =>
+				void this.app.workspace.openLinkText(path, "", newLeaf),
 			() => this.data,
 			() => this.mapConfig,
-			(prop) => this.config.getDisplayName(prop)
+			(prop) => this.config.getDisplayName(prop),
 		);
 	}
 
 	onload(): void {
 		// Listen for theme changes to update map tiles
-		this.registerEvent(this.app.workspace.on('css-change', this.onThemeChange, this));
+		this.registerEvent(
+			this.app.workspace.on("css-change", this.onThemeChange, this),
+		);
 	}
 
 	onunload() {
@@ -91,9 +125,12 @@ export class MapView extends BasesView {
 
 	/** Reduce flashing due to map re-rendering by debouncing while resizes are still ocurring. */
 	private onResizeDebounce = debounce(
-		() => { if (this.map) this.map.resize() },
+		() => {
+			if (this.map) this.map.resize();
+		},
 		100,
-		true);
+		true,
+	);
 
 	onResize(): void {
 		this.onResizeDebounce();
@@ -109,20 +146,116 @@ export class MapView extends BasesView {
 		}
 	};
 
+	private computeYearFromConfig(cfg: MapConfig): number {
+		const hi = new Date().getFullYear() + 100;
+		const lo = -5000;
+		const parsed =
+			cfg.year == null
+				? Number.NaN
+				: typeof cfg.year === "number"
+					? cfg.year
+					: Number.parseInt(String(cfg.year).trim(), 10);
+		const n = Number.isFinite(parsed)
+			? Math.trunc(parsed)
+			: new Date().getFullYear();
+		return Math.min(hi, Math.max(lo, n));
+	}
+
+	private syncVectorStateFromMapConfig(cfg: MapConfig): void {
+		this.vectorFilterYear = this.computeYearFromConfig(cfg);
+		if (this.tweakBinding) {
+			this.tweakBinding.year = this.vectorFilterYear;
+			this.configPane?.refreshPanel();
+		}
+	}
+
+	private applyVectorYearFilter(): void {
+		if (!this.map) return;
+		applyYearFilter(this.map, this.vectorFilterYear, this.vectorTimeMapSource);
+	}
+
+	private disposeConfigPane(): void {
+		this.configPane?.dispose();
+		this.configPane = null;
+		this.tweakBinding = null;
+		if (this.paneHostEl) {
+			this.paneHostEl.remove();
+			this.paneHostEl = null;
+		}
+		this.containerEl.removeClass("ohm-api-history-map-wrap");
+	}
+
+	private mountConfigPaneAfterMapCreated(): void {
+		if (!this.plugin.settings.showBasesMapConfigPane) return;
+		if (this.configPane || !this.map || !this.mapConfig) return;
+
+		this.containerEl.addClass("ohm-api-history-map-wrap");
+		this.paneHostEl = this.containerEl.createDiv({
+			cls: "ohm-api-tweakpane-host",
+		});
+
+		const c = this.map.getCenter();
+		this.vectorTimeMapSource =
+			this.plugin.settings.defaultTimeMapSourceName?.trim() || "timemap";
+		const binding: HistoryMapConfigBinding = {
+			latitude: c.lat,
+			longitude: c.lng,
+			zoom: this.map.getZoom(),
+			minZoom: this.mapConfig.minZoom,
+			maxZoom: this.mapConfig.maxZoom,
+			heightPx: this.mapConfig.mapHeight,
+			year: this.vectorFilterYear,
+			timeMapSourceName: this.vectorTimeMapSource,
+		};
+		this.tweakBinding = binding;
+
+		this.configPane = mountHistoryMapConfigPane({
+			host: this.paneHostEl,
+			map: this.map,
+			mapElement: this.mapEl,
+			binding,
+			showYear: true,
+			showTimeMapSource: true,
+			onYearChange: (y) => {
+				const hi = new Date().getFullYear() + 100;
+				const lo = -5000;
+				const clamped = Math.min(hi, Math.max(lo, Math.trunc(y)));
+				this.vectorFilterYear = clamped;
+				binding.year = clamped;
+				// Keep the view option in sync so future refreshes don't override it.
+				this.config.set("defaultYear", String(clamped));
+				if (this.mapConfig) {
+					this.mapConfig.year = String(clamped);
+				}
+				this.applyVectorYearFilter();
+			},
+			onTimeMapSourceChange: (name) => {
+				this.vectorTimeMapSource = name;
+				binding.timeMapSourceName = name;
+				this.applyVectorYearFilter();
+			},
+		});
+	}
+
 	private async updateMapStyle(): Promise<void> {
 		if (!this.map || !this.mapConfig) return;
-		const newStyle = await this.styleManager.getMapStyle(this.mapConfig.mapTiles, this.mapConfig.mapTilesDark);
+		const newStyle = await this.styleManager.getMapStyle(
+			this.mapConfig.mapTiles,
+			this.mapConfig.mapTilesDark,
+		);
 		this.map.setStyle(newStyle);
 		this.markerManager.clearLoadedIcons();
 
 		// Re-add markers after style change since setStyle removes all runtime layers
-		this.map.once('styledata', () => {
+		this.map.once("styledata", () => {
 			void this.markerManager.updateMarkers(this.data);
 		});
 	}
 
 	private async switchToTileSet(tileSetId: string): Promise<void> {
-		const tileSet = this.plugin.settings.tileSets.find(ts => ts.id === tileSetId);
+		const tileSet = this.plugin.settings.tileSets.find(
+			(ts) => ts.id === tileSetId,
+		);
 		if (!tileSet || !this.mapConfig) return;
 
 		this.mapConfig.currentTileSetId = tileSetId;
@@ -131,29 +264,20 @@ export class MapView extends BasesView {
 		this.mapConfig.mapTiles = tileSet.lightTiles ? [tileSet.lightTiles] : [];
 		this.mapConfig.mapTilesDark = tileSet.darkTiles
 			? [tileSet.darkTiles]
-			: (tileSet.lightTiles ? [tileSet.lightTiles] : []);
+			: tileSet.lightTiles
+				? [tileSet.lightTiles]
+				: [];
 
 		// Update the map style
 		await this.updateMapStyle();
 	}
 
 	private async initializeMap(): Promise<void> {
-		if (this.map) return;
-
-		// Initialize RTL text plugin once
-		if (!MapView.rtlPluginInitialized) {
-			try {
-				// Create a blob URL from the bundled RTL plugin code
-				// The plugin needs to run in a worker context
-				const blob = new Blob([rtlPluginCode], { type: 'application/javascript' });
-				const blobURL = URL.createObjectURL(blob);
-				// Set lazy loading to false - plugin is initialized since code is already bundled
-				setRTLTextPlugin(blobURL, false);
-				MapView.rtlPluginInitialized = true;
-			} catch (error) {
-				console.warn('Failed to initialize RTL text plugin:', error);
-			}
+		if (this.map) {
+			return;
 		}
+
+		ensureMaplibreGlobalInit();
 
 		// Load config first
 		const currentTileSetId = this.mapConfig?.currentTileSetId || null;
@@ -162,18 +286,23 @@ export class MapView extends BasesView {
 		// Set initial map height based on context
 		const isEmbedded = this.isEmbedded();
 		if (isEmbedded) {
-			this.mapEl.style.height = this.mapConfig.mapHeight + 'px';
-		}
-		else {
+			this.mapEl.style.height = this.mapConfig.mapHeight + "px";
+		} else {
 			// Let CSS handle the height for direct base file views
-			this.mapEl.style.height = '';
+			this.mapEl.style.height = "";
 		}
 
 		// Get the map style (may involve fetching remote style JSON)
-		const mapStyle = await this.styleManager.getMapStyle(this.mapConfig.mapTiles, this.mapConfig.mapTilesDark);
+		const mapStyle = await this.styleManager.getMapStyle(
+			this.mapConfig.mapTiles,
+			this.mapConfig.mapTilesDark,
+		);
 
 		// Determine initial position: prefer ephemeral state if available, otherwise use config
-		let initialCenter: [number, number] = [this.mapConfig.center[1], this.mapConfig.center[0]]; // MapLibre uses [lng, lat]
+		let initialCenter: [number, number] = [
+			this.mapConfig.center[1],
+			this.mapConfig.center[0],
+		]; // MapLibre uses [lng, lat]
 		let initialZoom = this.mapConfig.defaultZoom;
 
 		// Capture if we are starting with a pending state restoration
@@ -185,11 +314,14 @@ export class MapView extends BasesView {
 				// Handle LngLatLike (array or object)
 				if (Array.isArray(c)) {
 					initialCenter = [c[0], c[1]];
-				} else if (typeof c === 'object' && 'lng' in c && 'lat' in c) {
+				} else if (typeof c === "object" && "lng" in c && "lat" in c) {
 					initialCenter = [c.lng, c.lat];
 				}
 			}
-			if (this.pendingMapState.zoom !== undefined && this.pendingMapState.zoom !== null) {
+			if (
+				this.pendingMapState.zoom !== undefined &&
+				this.pendingMapState.zoom !== null
+			) {
 				initialZoom = this.pendingMapState.zoom;
 			}
 		}
@@ -204,76 +336,94 @@ export class MapView extends BasesView {
 			maxZoom: this.mapConfig.maxZoom,
 		});
 
+		this.syncVectorStateFromMapConfig(this.mapConfig);
+
 		// Set map reference in managers
 		this.popupManager.setMap(this.map);
 		this.markerManager.setMap(this.map);
 
-		this.map.addControl(new CustomZoomControl(), 'top-right');
+		this.mountConfigPaneAfterMapCreated();
+
+		this.map.addControl(new CustomZoomControl(), "top-right");
 
 		// Add background switcher if multiple tile sets are available
 		if (this.plugin.settings.tileSets.length > 1) {
-			const currentId = this.mapConfig.currentTileSetId || this.plugin.settings.tileSets[0]?.id || '';
+			const currentId =
+				this.mapConfig.currentTileSetId ||
+				this.plugin.settings.tileSets[0]?.id ||
+				"";
 			if (currentId) {
 				this.map.addControl(
 					new BackgroundSwitcherControl(
 						this.plugin.settings.tileSets,
 						currentId,
-						(tileSetId) => this.switchToTileSet(tileSetId)
+						(tileSetId) => this.switchToTileSet(tileSetId),
 					),
-					'top-right'
+					"top-right",
 				);
 			}
 		}
 
-		this.map.on('error', (e) => {
-			console.warn('Map error:', e);
+		this.map.on("error", (e) => {
+			console.warn("Map error:", e);
 		});
 
 		// Ensure the center and zoom are set after map loads (in case the style loading overrides it)
-		this.map.on('load', () => {
+		this.map.on("load", () => {
 			if (!this.map || !this.mapConfig) return;
 
-			// If we were restoring state, do not reset to defaults
-			if (isRestoringState || this.pendingMapState) return;
+			const skipDefaultCenterZoom = isRestoringState || this.pendingMapState;
 
-			const hasConfiguredCenter = this.mapConfig.center[0] !== 0 || this.mapConfig.center[1] !== 0;
-			const hasConfiguredZoom = this.config.get('defaultZoom') && Number.isNumber(this.config.get('defaultZoom'));
+			if (!skipDefaultCenterZoom) {
+				const hasConfiguredCenter =
+					this.mapConfig.center[0] !== 0 || this.mapConfig.center[1] !== 0;
+				const hasConfiguredZoom =
+					this.config.get("defaultZoom") &&
+					Number.isNumber(this.config.get("defaultZoom"));
 
-			// Set center based on configuration
-			if (hasConfiguredCenter) {
-				this.map.setCenter([this.mapConfig.center[1], this.mapConfig.center[0]]); // MapLibre uses [lng, lat]
-			}
-			else {
-				const bounds = this.markerManager.getBounds();
-				if (bounds) {
-					this.map.setCenter(bounds.getCenter()); // Center on markers
+				// Set center based on configuration
+				if (hasConfiguredCenter) {
+					this.map.setCenter([
+						this.mapConfig.center[1],
+						this.mapConfig.center[0],
+					]); // MapLibre uses [lng, lat]
+				} else {
+					const bounds = this.markerManager.getBounds();
+					if (bounds) {
+						this.map.setCenter(bounds.getCenter()); // Center on markers
+					}
+				}
+
+				// Set zoom based on configuration
+				if (hasConfiguredZoom) {
+					this.map.setZoom(this.mapConfig.defaultZoom); // Use configured zoom
+				} else {
+					const bounds = this.markerManager.getBounds();
+					if (bounds) {
+						this.map.fitBounds(bounds, { padding: 20 }); // Fit all markers
+					}
 				}
 			}
 
-			// Set zoom based on configuration
-			if (hasConfiguredZoom) {
-				this.map.setZoom(this.mapConfig.defaultZoom); // Use configured zoom
-			}
-			else {
-				const bounds = this.markerManager.getBounds();
-				if (bounds) {
-					this.map.fitBounds(bounds, { padding: 20 }); // Fit all markers
-				}
-			}
+			this.applyVectorYearFilter();
+			this.configPane?.refreshViewFromMap();
 		});
 
 		// Hide tooltip on the map element.
-		this.mapEl.querySelector('canvas')?.style
-			.setProperty('--no-tooltip', 'true');
+		this.mapEl
+			.querySelector("canvas")
+			?.style.setProperty("--no-tooltip", "true");
 
 		// Add context menu to map
-		this.mapEl.addEventListener('contextmenu', (evt) => {
+		this.mapEl.addEventListener("contextmenu", (evt) => {
 			evt.preventDefault();
 			this.showMapContextMenu(evt);
 		});
 	}
 
 	private destroyMap(): void {
+		disposeMapTimeline(this.containerEl);
+		this.disposeConfigPane();
 		this.popupManager.destroy();
 		if (this.map) {
 			this.map.remove();
@@ -283,7 +433,7 @@ export class MapView extends BasesView {
 	}
 
 	public onDataUpdated(): void {
-		this.containerEl.removeClass('is-loading');
+		this.containerEl.removeClass("is-loading");
 
 		const configSnapshot = this.getConfigSnapshot();
 		const configChanged = this.lastConfigSnapshot !== configSnapshot;
@@ -291,8 +441,14 @@ export class MapView extends BasesView {
 		const currentTileSetId = this.mapConfig?.currentTileSetId || null;
 		this.mapConfig = this.loadConfig(currentTileSetId);
 
+		if (this.map && this.mapConfig) {
+			this.syncVectorStateFromMapConfig(this.mapConfig);
+			this.applyVectorYearFilter();
+		}
+
 		// Check if the evaluated center coordinates have changed
-		const centerChanged = this.mapConfig.center[0] !== this.lastEvaluatedCenter[0] ||
+		const centerChanged =
+			this.mapConfig.center[0] !== this.lastEvaluatedCenter[0] ||
 			this.mapConfig.center[1] !== this.lastEvaluatedCenter[1];
 
 		void this.initializeMap().then(async () => {
@@ -305,7 +461,12 @@ export class MapView extends BasesView {
 			// Update center when the evaluated center coordinates change
 			// (e.g., due to formula re-evaluation when active file changes)
 			// But skip if we're restoring ephemeral state
-			else if (this.map && !this.isFirstLoad && centerChanged && this.pendingMapState === null) {
+			else if (
+				this.map &&
+				!this.isFirstLoad &&
+				centerChanged &&
+				this.pendingMapState === null
+			) {
 				this.updateCenter();
 			}
 
@@ -322,12 +483,16 @@ export class MapView extends BasesView {
 						this.map.setZoom(zoom);
 					}
 					this.pendingMapState = null;
+					this.configPane?.refreshViewFromMap();
 				}
 			}
 
 			// Track state for next comparison
 			if (this.mapConfig) {
-				this.lastEvaluatedCenter = [this.mapConfig.center[0], this.mapConfig.center[1]];
+				this.lastEvaluatedCenter = [
+					this.mapConfig.center[0],
+					this.mapConfig.center[1],
+				];
 			}
 		});
 	}
@@ -335,7 +500,7 @@ export class MapView extends BasesView {
 	private updateZoom(): void {
 		if (!this.map || !this.mapConfig) return;
 
-		const hasConfiguredZoom = this.config.get('defaultZoom') != null;
+		const hasConfiguredZoom = this.config.get("defaultZoom") != null;
 		if (hasConfiguredZoom) {
 			this.map.setZoom(this.mapConfig.defaultZoom);
 		}
@@ -344,14 +509,19 @@ export class MapView extends BasesView {
 	private updateCenter(): void {
 		if (!this.map || !this.mapConfig) return;
 
-		const hasConfiguredCenter = this.mapConfig.center[0] !== 0 || this.mapConfig.center[1] !== 0;
+		const hasConfiguredCenter =
+			this.mapConfig.center[0] !== 0 || this.mapConfig.center[1] !== 0;
 		if (hasConfiguredCenter) {
 			// Only recenter if the evaluated coordinates actually changed
 			const currentCenter = this.map.getCenter();
 			if (!currentCenter) return; // Map not fully initialized yet
 
-			const targetCenter: [number, number] = [this.mapConfig.center[1], this.mapConfig.center[0]]; // MapLibre uses [lng, lat]
-			const centerActuallyChanged = Math.abs(currentCenter.lng - targetCenter[0]) > 0.00001 ||
+			const targetCenter: [number, number] = [
+				this.mapConfig.center[1],
+				this.mapConfig.center[0],
+			]; // MapLibre uses [lng, lat]
+			const centerActuallyChanged =
+				Math.abs(currentCenter.lng - targetCenter[0]) > 0.00001 ||
 				Math.abs(currentCenter.lat - targetCenter[1]) > 0.00001;
 			if (centerActuallyChanged) {
 				this.map.setCenter(targetCenter);
@@ -359,8 +529,13 @@ export class MapView extends BasesView {
 		}
 	}
 
-	private async applyConfigToMap(oldSnapshot: string | null, newSnapshot: string): Promise<void> {
-		if (!this.map || !this.mapConfig) return;
+	private async applyConfigToMap(
+		oldSnapshot: string | null,
+		newSnapshot: string,
+	): Promise<void> {
+		if (!this.map || !this.mapConfig) {
+			return;
+		}
 
 		// Parse snapshots to detect specific changes
 		const oldConfig = oldSnapshot ? JSON.parse(oldSnapshot) : null;
@@ -369,8 +544,11 @@ export class MapView extends BasesView {
 		// Detect what changed
 		const centerConfigChanged = oldConfig?.center !== newConfig.center;
 		const zoomConfigChanged = oldConfig?.defaultZoom !== newConfig.defaultZoom;
-		const tilesChanged = JSON.stringify(oldConfig?.mapTiles) !== JSON.stringify(newConfig.mapTiles) ||
-			JSON.stringify(oldConfig?.mapTilesDark) !== JSON.stringify(newConfig.mapTilesDark);
+		const tilesChanged =
+			JSON.stringify(oldConfig?.mapTiles) !==
+				JSON.stringify(newConfig.mapTiles) ||
+			JSON.stringify(oldConfig?.mapTilesDark) !==
+				JSON.stringify(newConfig.mapTilesDark);
 		const heightChanged = oldConfig?.mapHeight !== newConfig.mapHeight;
 
 		// Update map constraints
@@ -403,7 +581,10 @@ export class MapView extends BasesView {
 
 		// Update map style if tiles configuration changed
 		if (this.isFirstLoad || tilesChanged) {
-			const newStyle = await this.styleManager.getMapStyle(this.mapConfig.mapTiles, this.mapConfig.mapTilesDark);
+			const newStyle = await this.styleManager.getMapStyle(
+				this.mapConfig.mapTiles,
+				this.mapConfig.mapTilesDark,
+			);
 			const currentStyle = this.map.getStyle();
 			if (JSON.stringify(newStyle) !== JSON.stringify(currentStyle)) {
 				this.map.setStyle(newStyle);
@@ -414,14 +595,20 @@ export class MapView extends BasesView {
 		// Update map height for embedded views if height changed
 		if (this.isFirstLoad || heightChanged) {
 			if (this.isEmbedded()) {
-				this.mapEl.style.height = this.mapConfig.mapHeight + 'px';
-			}
-			else {
-				this.mapEl.style.height = '';
+				this.mapEl.style.height = this.mapConfig.mapHeight + "px";
+			} else {
+				this.mapEl.style.height = "";
 			}
 			// Resize map after height changes
 			this.map.resize();
 		}
+
+		if (this.tweakBinding && this.mapConfig) {
+			this.tweakBinding.minZoom = this.mapConfig.minZoom;
+			this.tweakBinding.maxZoom = this.mapConfig.maxZoom;
+			this.tweakBinding.heightPx = this.mapConfig.mapHeight;
+		}
+		this.configPane?.refreshViewFromMap();
 	}
 
 	isEmbedded(): boolean {
@@ -429,7 +616,10 @@ export class MapView extends BasesView {
 		// If the scrollEl has a parent with 'bases-embed' class, it's embedded
 		let element = this.scrollEl.parentElement;
 		while (element) {
-			if (element.hasClass('bases-embed') || element.hasClass('block-language-base')) {
+			if (
+				element.hasClass("bases-embed") ||
+				element.hasClass("block-language-base")
+			) {
 				return true;
 			}
 			element = element.parentElement;
@@ -439,27 +629,39 @@ export class MapView extends BasesView {
 
 	private loadConfig(currentTileSetId: string | null): MapConfig {
 		// Load property configurations
-		const coordinatesProp = this.config.getAsPropertyId('coordinates');
-		const markerIconProp = this.config.getAsPropertyId('markerIcon');
-		const markerColorProp = this.config.getAsPropertyId('markerColor');
+		// Bases view option defaults are not always materialized into config storage,
+		// so we apply the same defaults here when the user hasn't set a value.
+		const coordinatesProp =
+			this.config.getAsPropertyId("coordinates") ??
+			("note.coordinates" as BasesPropertyId);
+		const yearProperty =
+			this.config.getAsPropertyId("yearProperty") ??
+			("note.start" as BasesPropertyId);
+		const markerIconProp = this.config.getAsPropertyId("markerIcon");
+		const markerColorProp = this.config.getAsPropertyId("markerColor");
 
 		// Load numeric configurations with validation
-		const minZoom = this.getNumericConfig('minZoom', 0, 0, 24);
-		const maxZoom = this.getNumericConfig('maxZoom', 18, 0, 24);
-		const defaultZoom = this.getNumericConfig('defaultZoom', DEFAULT_MAP_ZOOM, minZoom, maxZoom);
+		const minZoom = this.getNumericConfig("minZoom", 1, 1, 24);
+		const maxZoom = this.getNumericConfig("maxZoom", 18, 1, 24);
+		const defaultZoom = this.getNumericConfig(
+			"defaultZoom",
+			DEFAULT_MAP_ZOOM,
+			minZoom,
+			maxZoom,
+		);
 
 		// Load center coordinates
 		const center = this.getCenterFromConfig();
 
 		// Load map height for embedded views
 		const mapHeight = this.isEmbedded()
-			? this.getNumericConfig('mapHeight', DEFAULT_MAP_HEIGHT, 100, 2000)
+			? this.getNumericConfig("mapHeight", DEFAULT_MAP_HEIGHT, 100, 2000)
 			: DEFAULT_MAP_HEIGHT;
 
 		// Load map tiles configurations
 		// Use view-specific tiles if configured, otherwise fall back to plugin defaults
-		const viewSpecificTiles = this.getArrayConfig('mapTiles');
-		const viewSpecificTilesDark = this.getArrayConfig('mapTilesDark');
+		const viewSpecificTiles = this.getArrayConfig("mapTiles");
+		const viewSpecificTilesDark = this.getArrayConfig("mapTilesDark");
 
 		let mapTiles: string[];
 		let mapTilesDark: string[];
@@ -473,7 +675,7 @@ export class MapView extends BasesView {
 		} else if (this.plugin.settings.tileSets.length > 0) {
 			// Use first tile set from plugin settings (or previously selected one)
 			const tileSet = currentTileSetId
-				? this.plugin.settings.tileSets.find(ts => ts.id === currentTileSetId)
+				? this.plugin.settings.tileSets.find((ts) => ts.id === currentTileSetId)
 				: null;
 			const selectedTileSet = tileSet || this.plugin.settings.tileSets[0];
 
@@ -481,7 +683,9 @@ export class MapView extends BasesView {
 			mapTiles = selectedTileSet.lightTiles ? [selectedTileSet.lightTiles] : [];
 			mapTilesDark = selectedTileSet.darkTiles
 				? [selectedTileSet.darkTiles]
-				: (selectedTileSet.lightTiles ? [selectedTileSet.lightTiles] : []);
+				: selectedTileSet.lightTiles
+					? [selectedTileSet.lightTiles]
+					: [];
 		} else {
 			// No tiles configured, will fall back to default style
 			mapTiles = [];
@@ -490,6 +694,9 @@ export class MapView extends BasesView {
 		}
 
 		return {
+			year: this.config.get("defaultYear") as number | string | null,
+			yearProperty,
+
 			coordinatesProp,
 			markerIconProp,
 			markerColorProp,
@@ -504,9 +711,14 @@ export class MapView extends BasesView {
 		};
 	}
 
-	private getNumericConfig(key: string, defaultValue: number, min?: number, max?: number): number {
+	private getNumericConfig(
+		key: string,
+		defaultValue: number,
+		min?: number,
+		max?: number,
+	): number {
 		const value = this.config.get(key);
-		if (value == null || typeof value !== 'number') return defaultValue;
+		if (value == null || typeof value !== "number") return defaultValue;
 
 		let result = value;
 		if (min !== undefined) result = Math.max(min, result);
@@ -520,11 +732,13 @@ export class MapView extends BasesView {
 
 		// Handle array values
 		if (Array.isArray(value)) {
-			return value.filter(item => typeof item === 'string' && item.trim().length > 0);
+			return value.filter(
+				(item) => typeof item === "string" && item.trim().length > 0,
+			);
 		}
 
 		// Handle single string value
-		if (typeof value === 'string' && value.trim().length > 0) {
+		if (typeof value === "string" && value.trim().length > 0) {
 			return [value.trim()];
 		}
 
@@ -533,28 +747,26 @@ export class MapView extends BasesView {
 
 	private getCenterFromConfig(): [number, number] {
 		let centerConfig: Value;
-		
+
 		try {
-			centerConfig = this.config.getEvaluatedFormula(this, 'center');
+			centerConfig = this.config.getEvaluatedFormula(this, "center");
 		} catch (error) {
 			// Formula evaluation failed (e.g., this.file is null when no active file)
 			// Fall back to raw config value
-			const centerConfigStr = this.config.get('center');
+			const centerConfigStr = this.config.get("center");
 			if (String.isString(centerConfigStr)) {
 				centerConfig = new StringValue(centerConfigStr);
-			}
-			else {
+			} else {
 				return DEFAULT_MAP_CENTER;
 			}
 		}
 
 		// Support for legacy string format.
 		if (Value.equals(centerConfig, NullValue.value)) {
-			const centerConfigStr = this.config.get('center');
+			const centerConfigStr = this.config.get("center");
 			if (String.isString(centerConfigStr)) {
 				centerConfig = new StringValue(centerConfigStr);
-			}
-			else {
+			} else {
 				return DEFAULT_MAP_CENTER;
 			}
 		}
@@ -564,13 +776,15 @@ export class MapView extends BasesView {
 	private getConfigSnapshot(): string {
 		// Create a snapshot of config values that affect map display
 		return JSON.stringify({
-			center: this.config.get('center'),
-			defaultZoom: this.config.get('defaultZoom'),
-			minZoom: this.config.get('minZoom'),
-			maxZoom: this.config.get('maxZoom'),
-			mapHeight: this.config.get('mapHeight'),
-			mapTiles: this.config.get('mapTiles'),
-			mapTilesDark: this.config.get('mapTilesDark'),
+			center: this.config.get("center"),
+			defaultZoom: this.config.get("defaultZoom"),
+			minZoom: this.config.get("minZoom"),
+			maxZoom: this.config.get("maxZoom"),
+			mapHeight: this.config.get("mapHeight"),
+			mapTiles: this.config.get("mapTiles"),
+			mapTilesDark: this.config.get("mapTilesDark"),
+			year: this.config.get("defaultYear"),
+			yearProperty: this.config.get("yearProperty"),
 		});
 	}
 
@@ -586,64 +800,73 @@ export class MapView extends BasesView {
 		const currentLng = Math.round(clickedCoords.lng * 100000) / 100000;
 
 		const menu = Menu.forEvent(evt);
-		menu.addItem(item => item
-			.setTitle('New note')
-			.setSection('action')
-			.setIcon('square-pen')
-			.onClick(() => {
-				void this.createFileForView('', (frontmatter) => {
-					// Pre-fill coordinates if a coordinates property is configured
-					if (this.mapConfig?.coordinatesProp) {
-						// Remove 'note.' prefix if present
-						const propertyKey = this.mapConfig.coordinatesProp.startsWith('note.')
-							? this.mapConfig.coordinatesProp.slice(5)
-							: this.mapConfig.coordinatesProp;
-						frontmatter[propertyKey] = [currentLat.toString(), currentLng.toString()];
+		menu.addItem((item) =>
+			item
+				.setTitle("New note")
+				.setSection("action")
+				.setIcon("square-pen")
+				.onClick(() => {
+					void this.createFileForView("", (frontmatter) => {
+						// Pre-fill coordinates if a coordinates property is configured
+						if (this.mapConfig?.coordinatesProp) {
+							// Remove 'note.' prefix if present
+							const propertyKey = this.mapConfig.coordinatesProp.startsWith(
+								"note.",
+							)
+								? this.mapConfig.coordinatesProp.slice(5)
+								: this.mapConfig.coordinatesProp;
+							frontmatter[propertyKey] = [
+								currentLat.toString(),
+								currentLng.toString(),
+							];
+						}
+					});
+				}),
+		);
+
+		menu.addItem((item) =>
+			item
+				.setTitle("Copy coordinates")
+				.setSection("action")
+				.setIcon("copy")
+				.onClick(() => {
+					const coordString = `${currentLat}, ${currentLng}`;
+					void navigator.clipboard.writeText(coordString);
+				}),
+		);
+
+		menu.addItem((item) =>
+			item
+				.setTitle("Set default center point")
+				.setSection("action")
+				.setIcon("map-pin")
+				.onClick(() => {
+					// Set the current center as the default coordinates
+					const coordListStr = `[${currentLat}, ${currentLng}]`;
+
+					// 1. Update the component's internal state immediately.
+					// This ensures that if a re-render is triggered, its logic will use the
+					// new coordinates and prevent the map from recentering on markers.
+					if (this.mapConfig) {
+						this.mapConfig.center = [currentLat, currentLng];
 					}
-				});
-			})
+
+					// 2. Set the config value, which will be saved.
+					this.config.set("center", coordListStr);
+
+					// 3. Immediately move the map for instant user feedback.
+					this.map?.setCenter([currentLng, currentLat]); // MapLibre uses [lng, lat]
+				}),
 		);
 
-		menu.addItem(item => item
-			.setTitle('Copy coordinates')
-			.setSection('action')
-			.setIcon('copy')
-			.onClick(() => {
-				const coordString = `${currentLat}, ${currentLng}`;
-				void navigator.clipboard.writeText(coordString);
-			})
-		);
-
-		menu.addItem(item => item
-			.setTitle('Set default center point')
-			.setSection('action')
-			.setIcon('map-pin')
-			.onClick(() => {
-				// Set the current center as the default coordinates
-				const coordListStr = `[${currentLat}, ${currentLng}]`;
-
-				// 1. Update the component's internal state immediately.
-				// This ensures that if a re-render is triggered, its logic will use the
-				// new coordinates and prevent the map from recentering on markers.
-				if (this.mapConfig) {
-					this.mapConfig.center = [currentLat, currentLng];
-				}
-
-				// 2. Set the config value, which will be saved.
-				this.config.set('center', coordListStr);
-
-				// 3. Immediately move the map for instant user feedback.
-				this.map?.setCenter([currentLng, currentLat]); // MapLibre uses [lng, lat]
-			})
-		);
-
-		menu.addItem(item => item
-			.setTitle(`Set default zoom (${currentZoom})`)
-			.setSection('action')
-			.setIcon('crosshair')
-			.onClick(() => {
-				this.config.set('defaultZoom', currentZoom);
-			})
+		menu.addItem((item) =>
+			item
+				.setTitle(`Set default zoom (${currentZoom})`)
+				.setSection("action")
+				.setIcon("crosshair")
+				.onClick(() => {
+					this.config.set("defaultZoom", currentZoom);
+				}),
 		);
 	}
 
@@ -654,15 +877,19 @@ export class MapView extends BasesView {
 		}
 
 		this.pendingMapState = {};
-		if (hasOwnProperty(state, 'center') && hasOwnProperty(state.center, 'lng') && hasOwnProperty(state.center, 'lat')) {
+		if (
+			hasOwnProperty(state, "center") &&
+			hasOwnProperty(state.center, "lng") &&
+			hasOwnProperty(state.center, "lat")
+		) {
 			const lng = state.center.lng;
 			const lat = state.center.lat;
 
-			if (typeof lng === 'number' && typeof lat === 'number') {
+			if (typeof lng === "number" && typeof lat === "number") {
 				this.pendingMapState.center = { lng, lat };
 			}
 		}
-		if (hasOwnProperty(state, 'zoom') && typeof state.zoom === 'number') {
+		if (hasOwnProperty(state, "zoom") && typeof state.zoom === "number") {
 			this.pendingMapState.zoom = state.zoom;
 		}
 	}
@@ -677,99 +904,112 @@ export class MapView extends BasesView {
 		};
 	}
 
-	static getViewOptions(): ViewOption[] {
+	static getViewOptions(_config: BasesViewConfig): BasesAllOptions[] {
 		return [
 			{
-				displayName: 'Embedded height',
-				type: 'slider',
-				key: 'mapHeight',
+				displayName: "Embedded height",
+				type: "slider",
+				key: "mapHeight",
 				min: 200,
 				max: 800,
 				step: 20,
 				default: DEFAULT_MAP_HEIGHT,
 			},
 			{
-				displayName: 'Display',
-				type: 'group',
+				displayName: "Display",
+				type: "group",
 				items: [
-
 					{
-						displayName: 'Center coordinates',
-						type: 'formula',
-						key: 'center',
-						placeholder: '[latitude, longitude]',
+						displayName: "Default Year",
+						type: "text",
+						key: "defaultYear",
+						placeholder: String(new Date().getFullYear()),
+						default: String(new Date().getFullYear()),
 					},
 					{
-						displayName: 'Default zoom',
-						type: 'slider',
-						key: 'defaultZoom',
+						displayName: "Year property",
+						type: "property",
+						key: "yearProperty",
+						default: "note.start",
+					},
+					{
+						displayName: "Center coordinates",
+						type: "formula",
+						key: "center",
+						placeholder: "[latitude, longitude]",
+					},
+					{
+						displayName: "Default zoom",
+						type: "slider",
+						key: "defaultZoom",
 						min: 1,
 						max: 18,
 						step: 1,
 						default: DEFAULT_MAP_ZOOM,
 					},
 					{
-						displayName: 'Minimum zoom',
-						type: 'slider',
-						key: 'minZoom',
-						min: 0,
+						displayName: "Minimum zoom",
+						type: "slider",
+						key: "minZoom",
+						min: 1,
 						max: 24,
 						step: 1,
-						default: 0,
+						default: 1,
 					},
 					{
-						displayName: 'Maximum zoom',
-						type: 'slider',
-						key: 'maxZoom',
-						min: 0,
+						displayName: "Maximum zoom",
+						type: "slider",
+						key: "maxZoom",
+						min: 1,
 						max: 24,
 						step: 1,
-						default: 18,
+						default: 14,
 					},
-				]
+				],
 			},
 			{
-				displayName: 'Markers',
-				type: 'group',
+				displayName: "Markers",
+				type: "group",
 				items: [
 					{
-						displayName: 'Marker coordinates',
-						type: 'property',
-						key: 'coordinates',
-						filter: prop => !prop.startsWith('file.'),
-						placeholder: 'Property',
+						displayName: "Marker coordinates",
+						type: "property",
+						key: "coordinates",
+						default: "note.coordinates",
+						filter: (prop) => !prop.startsWith("file."),
+						placeholder: "Property",
 					},
 					{
-						displayName: 'Marker icon',
-						type: 'property',
-						key: 'markerIcon',
-						filter: prop => !prop.startsWith('file.'),
-						placeholder: 'Property',
+						displayName: "Marker icon",
+						type: "property",
+						key: "markerIcon",
+						filter: (prop) => !prop.startsWith("file."),
+						placeholder: "Property",
 					},
 					{
-						displayName: 'Marker color',
-						type: 'property',
-						key: 'markerColor',
-						filter: prop => !prop.startsWith('file.'),
-						placeholder: 'Property',
+						displayName: "Marker color",
+						type: "property",
+						key: "markerColor",
+						filter: (prop) => !prop.startsWith("file."),
+						placeholder: "Property",
 					},
-				]
+				],
 			},
 			{
-				displayName: 'Background',
-				type: 'group',
+				displayName: "Background",
+				type: "group",
 				items: [
 					{
-						displayName: 'Map tiles',
-						type: 'multitext',
-						key: 'mapTiles',
+						displayName: "Map tiles",
+						type: "multitext",
+						key: "mapTiles",
 					},
 					{
-						displayName: 'Map tiles in dark mode',
-						type: 'multitext',
-						key: 'mapTilesDark',
+						displayName: "Map tiles in dark mode",
+						type: "multitext",
+						key: "mapTilesDark",
 					},
-				]
+				],
 			},
 		];
 	}
