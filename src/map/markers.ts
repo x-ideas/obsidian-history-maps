@@ -164,6 +164,9 @@ export class MarkerManager {
 	}
 
 	getBounds(): LngLatBounds | null {
+		if (!this.bounds || this.bounds.isEmpty()) {
+			return null;
+		}
 		return this.bounds;
 	}
 
@@ -228,12 +231,17 @@ export class MarkerManager {
 
 		this.markers = validMarkers;
 
-		// Calculate bounds for all markers
-		const bounds = (this.bounds = new LngLatBounds());
-		validMarkers.forEach((markerData) => {
-			const [lat, lng] = markerData.coordinates;
-			bounds.extend([lng, lat]);
-		});
+		// Calculate bounds for all markers (null when empty — fitBounds crashes on empty LngLatBounds)
+		if (validMarkers.length === 0) {
+			this.bounds = null;
+		} else {
+			const bounds = new LngLatBounds();
+			for (const markerData of validMarkers) {
+				const [lat, lng] = markerData.coordinates;
+				bounds.extend([lng, lat]);
+			}
+			this.bounds = bounds;
+		}
 
 		// Load all custom icons and create GeoJSON features
 		await this.loadCustomIcons(validMarkers);
