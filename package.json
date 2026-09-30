@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-history-maps",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"description": "Adds history map view to Obsidian Bases.",
 	"main": "main.js",
 	"scripts": {
